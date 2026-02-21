@@ -1,0 +1,19 @@
+[package]
+name = "http2-proto"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ringline-rs/http2-proto"
+description = "HTTP/2 protocol implementation with optional TLS transport"
+readme = "README.md"
+keywords = ["http2", "h2", "protocol", "parser"]
+categories = ["network-programming", "parsing"]
+
+[features]
+default = ["tls"]
+tls = ["dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+bytes = "1"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = { version = "0.26", optional = true }
