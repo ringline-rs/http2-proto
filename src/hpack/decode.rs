@@ -244,16 +244,19 @@ fn decode_integer(data: &[u8], prefix_bits: u8) -> Result<(usize, usize), HpackE
         let byte = data[consumed] as usize;
         consumed += 1;
 
-        value += (byte & 0x7f) << shift;
-        shift += 7;
+        let digit = byte & 0x7f;
+        if shift >= usize::BITS || digit > (usize::MAX >> shift) {
+            return Err(HpackError::InvalidInteger);
+        }
+        value = value
+            .checked_add(digit << shift)
+            .ok_or(HpackError::InvalidInteger)?;
 
         if byte & 0x80 == 0 {
             break;
         }
 
-        if shift > 28 {
-            return Err(HpackError::InvalidInteger);
-        }
+        shift += 7;
     }
 
     Ok((value, consumed))
@@ -284,6 +287,109 @@ fn decode_string(data: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
     };
 
     Ok((result, consumed))
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::{HpackError, decode_integer};
+
+    const MAX_ENCODED_LEN: usize = 11;
+
+    enum Expected {
+        Decoded(usize, usize),
+        Incomplete,
+        Invalid,
+    }
+
+    fn reference_decode(data: &[u8], prefix_bits: u8) -> Expected {
+        if data.is_empty() {
+            return Expected::Incomplete;
+        }
+
+        let max_prefix = (1u128 << prefix_bits) - 1;
+        let mut value = (data[0] as u128) & max_prefix;
+        if value < max_prefix {
+            return Expected::Decoded(value as usize, 1);
+        }
+
+        let mut consumed = 1;
+        let mut shift = 0;
+        while consumed < data.len() {
+            let byte = data[consumed];
+            let digit = (byte & 0x7f) as u128;
+            if shift >= usize::BITS {
+                return Expected::Invalid;
+            }
+            value += digit << shift;
+            if value > usize::MAX as u128 {
+                return Expected::Invalid;
+            }
+            consumed += 1;
+            if byte & 0x80 == 0 {
+                return Expected::Decoded(value as usize, consumed);
+            }
+            shift += 7;
+        }
+
+        Expected::Incomplete
+    }
+
+    fn check_arbitrary_input(prefix_bits: u8) {
+        let data: [u8; MAX_ENCODED_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_ENCODED_LEN);
+        let input = &data[..len];
+
+        match (
+            reference_decode(input, prefix_bits),
+            decode_integer(input, prefix_bits),
+        ) {
+            (Expected::Decoded(expected, expected_consumed), Ok((actual, consumed))) => {
+                assert_eq!(actual, expected);
+                assert_eq!(consumed, expected_consumed);
+                assert!((1..=input.len()).contains(&consumed));
+            }
+            (Expected::Incomplete, Err(HpackError::Incomplete))
+            | (Expected::Invalid, Err(HpackError::InvalidInteger)) => {}
+            _ => panic!("decoder result disagrees with reference classification"),
+        }
+    }
+
+    #[kani::proof]
+    fn decode_integer_prefix_4() {
+        check_arbitrary_input(4);
+    }
+
+    #[kani::proof]
+    fn decode_integer_prefix_5() {
+        check_arbitrary_input(5);
+    }
+
+    #[kani::proof]
+    fn decode_integer_prefix_6() {
+        check_arbitrary_input(6);
+    }
+
+    #[kani::proof]
+    fn decode_integer_prefix_7() {
+        check_arbitrary_input(7);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn bounded_encode_decode_equivalence() {
+        let value: u16 = kani::any();
+        let prefix_bits: u8 = kani::any();
+        kani::assume((4..=7).contains(&prefix_bits));
+
+        let mut encoded = Vec::new();
+        super::super::encode::encode_integer(value as usize, prefix_bits, 0, &mut encoded);
+        let decoded = decode_integer(&encoded, prefix_bits);
+
+        assert!(
+            matches!(decoded, Ok((actual, consumed)) if actual == value as usize && consumed == encoded.len())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -412,13 +518,36 @@ mod tests {
 
     #[test]
     fn test_decode_integer_overflow() {
-        // Create a very long integer that would overflow
+        // The tenth base-128 digit cannot fit in usize on 64-bit targets.
         let data = [
-            0x1f, // Max 5-bit prefix
-            0xff, 0xff, 0xff, 0xff, 0xff, // Too many continuation bytes
+            0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
         ];
+
         let result = decode_integer(&data, 5);
+
         assert!(matches!(result, Err(HpackError::InvalidInteger)));
+    }
+
+    #[test]
+    fn test_decode_integer_long_continuation_is_incomplete() {
+        let data = [0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+
+        let result = decode_integer(&data, 5);
+
+        assert!(matches!(result, Err(HpackError::Incomplete)));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_decode_integer_accepts_value_above_u32_range() {
+        // 31 + 2^35, encoded with a 5-bit prefix. This is valid on all
+        // supported 64-bit targets and exercises the sixth continuation byte.
+        let data = [0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+
+        let (value, consumed) = decode_integer(&data, 5).unwrap();
+
+        assert_eq!(value, 34_359_738_399);
+        assert_eq!(consumed, data.len());
     }
 
     #[test]
@@ -437,6 +566,48 @@ mod tests {
         let (value, consumed) = decode_integer(&data, 7).unwrap();
         assert_eq!(value, 127);
         assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    #[ignore = "manual deterministic random benchmark"]
+    fn benchmark_decode_integer_bounded_random_inputs() {
+        const CASES: usize = 1_000_000;
+        const MAX_LEN: usize = 11;
+        let mut state = 0x4d59_5df4_d0f3_3173u64;
+        let mut decoded = 0usize;
+        let mut incomplete = 0usize;
+        let mut invalid = 0usize;
+        let started = std::time::Instant::now();
+
+        for _ in 0..CASES {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let prefix_bits = 4 + (state as u8 & 3);
+            let len = ((state >> 8) as usize) % (MAX_LEN + 1);
+            let mut data = [0u8; MAX_LEN];
+            for byte in &mut data {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+
+            match std::hint::black_box(decode_integer(&data[..len], prefix_bits)) {
+                Ok((_, consumed)) => {
+                    assert!((1..=len).contains(&consumed));
+                    decoded += 1;
+                }
+                Err(HpackError::Incomplete) => incomplete += 1,
+                Err(HpackError::InvalidInteger) => invalid += 1,
+                Err(_) => unreachable!("integer decoder returned a non-integer error"),
+            }
+        }
+
+        eprintln!(
+            "bounded random benchmark: {CASES} cases in {:?} ({decoded} decoded, {incomplete} incomplete, {invalid} invalid)",
+            started.elapsed()
+        );
     }
 
     // decode_string tests

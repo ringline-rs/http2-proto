@@ -132,7 +132,7 @@ impl HpackEncoder {
 }
 
 /// Encode an integer with a prefix (RFC 7541 Section 5.1).
-fn encode_integer(mut value: usize, prefix_bits: u8, prefix: u8, buf: &mut Vec<u8>) {
+pub(super) fn encode_integer(mut value: usize, prefix_bits: u8, prefix: u8, buf: &mut Vec<u8>) {
     let max_prefix: usize = (1 << prefix_bits) - 1;
 
     if value < max_prefix {
