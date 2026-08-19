@@ -244,7 +244,15 @@ fn decode_integer(data: &[u8], prefix_bits: u8) -> Result<(usize, usize), HpackE
         let byte = data[consumed] as usize;
         consumed += 1;
 
-        value += (byte & 0x7f) << shift;
+        // Compute the contribution in u64 so the shift cannot overflow on a
+        // 32-bit target, where `127 << 28` does not fit in `usize`. The
+        // previous `value += (byte & 0x7f) << shift` panicked there in debug
+        // builds and wrapped in release, on peer-controlled input.
+        let contribution = ((byte & 0x7f) as u64) << shift;
+        value = usize::try_from(contribution)
+            .ok()
+            .and_then(|c| value.checked_add(c))
+            .ok_or(HpackError::InvalidInteger)?;
         shift += 7;
 
         if byte & 0x80 == 0 {
@@ -289,6 +297,27 @@ fn decode_string(data: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_integer_max_multibyte_value_is_unchanged() {
+        // Five continuation bytes is the most the `shift > 28` guard allows.
+        // Pin the resulting value so the overflow guard added for 32-bit
+        // targets cannot silently change 64-bit behavior.
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        let (value, consumed) = decode_integer(&data, 8).expect("must decode");
+        assert_eq!(consumed, 6);
+        assert_eq!(
+            value,
+            255 + 127 + (127 << 7) + (127 << 14) + (127 << 21) + (127 << 28)
+        );
+
+        // A sixth continuation byte is still rejected.
+        let too_long = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert!(matches!(
+            decode_integer(&too_long, 8),
+            Err(HpackError::InvalidInteger)
+        ));
+    }
 
     // HpackError tests
 

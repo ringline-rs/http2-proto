@@ -109,8 +109,23 @@ impl Stream {
     }
 
     /// Increase the send window (from WINDOW_UPDATE).
-    pub fn increase_send_window(&mut self, increment: u32) {
-        self.send_window += increment as i32;
+    /// Increase the send window by a WINDOW_UPDATE increment.
+    ///
+    /// Returns `false` if the increment would take the window above
+    /// `MAX_WINDOW_SIZE` (2^31 - 1). RFC 7540 section 6.9.1 requires that case
+    /// to be a `FLOW_CONTROL_ERROR`; the window is left unchanged so the caller
+    /// can signal it. The previous unchecked `+=` overflowed instead: three
+    /// well-formed WINDOW_UPDATE frames of 2^30 panicked a debug build and
+    /// wrapped the window negative in release.
+    #[must_use = "an unapplied increment is a FLOW_CONTROL_ERROR and must be signalled"]
+    pub fn increase_send_window(&mut self, increment: u32) -> bool {
+        match self.send_window.checked_add_unsigned(increment) {
+            Some(w) => {
+                self.send_window = w;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Adjust the send window (from SETTINGS change).
@@ -137,6 +152,36 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_window_rejects_overflowing_increment() {
+        // WINDOW_UPDATE increments are peer-controlled and each fits the 31-bit
+        // field, so they accumulate. The unchecked `+=` panicked in a debug
+        // build and wrapped the window to -1073676289 in release.
+        let mut stream = Stream::new(StreamId::new(1), 65_535);
+        let mut applied = 0;
+        loop {
+            let before = stream.send_window();
+            if !stream.increase_send_window(1 << 30) {
+                assert_eq!(
+                    stream.send_window(),
+                    before,
+                    "a rejected increment must leave the window unchanged"
+                );
+                break;
+            }
+            applied += 1;
+            assert!(
+                stream.send_window() > 0,
+                "window wrapped negative after {applied} increments"
+            );
+            assert!(applied < 10, "increment was never rejected");
+        }
+        assert!(
+            applied >= 1,
+            "a legitimate increment must still be accepted"
+        );
+    }
 
     #[test]
     fn test_stream_new() {
@@ -217,7 +262,7 @@ mod tests {
         stream.send_data(1000);
         assert_eq!(stream.send_window(), 64535);
 
-        stream.increase_send_window(500);
+        assert!(stream.increase_send_window(500));
         assert_eq!(stream.send_window(), 65035);
     }
 
