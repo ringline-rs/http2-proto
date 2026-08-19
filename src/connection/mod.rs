@@ -381,11 +381,26 @@ impl<T: Transport> Connection<T> {
 
     /// Handle WINDOW_UPDATE frame.
     fn handle_window_update(&mut self, frame: WindowUpdateFrame) -> io::Result<()> {
-        if frame.stream_id.is_connection_level() {
-            self.flow_control.increase_window(frame.increment);
+        let applied = if frame.stream_id.is_connection_level() {
+            self.flow_control.increase_window(frame.increment)
         } else if let Some(stream) = self.streams.get_mut(&frame.stream_id.value()) {
-            stream.increase_send_window(frame.increment);
+            stream.increase_send_window(frame.increment)
+        } else {
+            // WINDOW_UPDATE for an unknown stream is ignored, as before.
+            true
+        };
+
+        if !applied {
+            // RFC 7540 section 6.9.1: a WINDOW_UPDATE that takes a flow-control
+            // window above 2^31 - 1 is a FLOW_CONTROL_ERROR.
+            self.events
+                .push(ConnectionEvent::Error(ConnectionError::Protocol(format!(
+                    "flow-control window overflow on stream {}: increment {} exceeds 2^31 - 1",
+                    frame.stream_id.value(),
+                    frame.increment
+                ))));
         }
+
         Ok(())
     }
 
