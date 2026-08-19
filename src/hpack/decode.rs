@@ -262,6 +262,20 @@ fn decode_integer(data: &[u8], prefix_bits: u8) -> Result<(usize, usize), HpackE
     Ok((value, consumed))
 }
 
+fn checked_string_end(
+    consumed: usize,
+    length: usize,
+    available: usize,
+) -> Result<usize, HpackError> {
+    let end = consumed
+        .checked_add(length)
+        .ok_or(HpackError::InvalidInteger)?;
+    if end > available {
+        return Err(HpackError::Incomplete);
+    }
+    Ok(end)
+}
+
 /// Decode an HPACK string (RFC 7541 Section 5.2).
 fn decode_string(data: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
     if data.is_empty() {
@@ -271,12 +285,10 @@ fn decode_string(data: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
     let huffman = (data[0] & 0x80) != 0;
     let (length, mut consumed) = decode_integer(data, 7)?;
 
-    if consumed + length > data.len() {
-        return Err(HpackError::Incomplete);
-    }
+    let end = checked_string_end(consumed, length, data.len())?;
 
-    let string_data = &data[consumed..consumed + length];
-    consumed += length;
+    let string_data = &data[consumed..end];
+    consumed = end;
 
     let result = if huffman {
         let mut decoded = Vec::new();
@@ -291,7 +303,7 @@ fn decode_string(data: &[u8]) -> Result<(Vec<u8>, usize), HpackError> {
 
 #[cfg(kani)]
 mod verification {
-    use super::{HpackError, decode_integer};
+    use super::{HpackError, checked_string_end, decode_integer};
 
     const MAX_ENCODED_LEN: usize = 11;
 
@@ -373,6 +385,27 @@ mod verification {
     #[kani::proof]
     fn decode_integer_prefix_7() {
         check_arbitrary_input(7);
+    }
+
+    #[kani::proof]
+    fn checked_string_extent_classification() {
+        let consumed: usize = kani::any();
+        let length: usize = kani::any();
+        let available: usize = kani::any();
+        let mathematical_end = consumed as u128 + length as u128;
+
+        match checked_string_end(consumed, length, available) {
+            Err(HpackError::InvalidInteger) => assert!(mathematical_end > usize::MAX as u128),
+            Err(HpackError::Incomplete) => {
+                assert!(mathematical_end <= usize::MAX as u128);
+                assert!(mathematical_end > available as u128);
+            }
+            Ok(end) => {
+                assert_eq!(end as u128, mathematical_end);
+                assert!(end <= available);
+            }
+            Err(_) => panic!("unexpected string extent error"),
+        }
     }
 
     #[kani::proof]
@@ -571,6 +604,9 @@ mod tests {
     #[test]
     #[ignore = "manual deterministic random benchmark"]
     fn benchmark_decode_integer_bounded_random_inputs() {
+        // This is deterministic sampling with aggregated outcomes, not exhaustive coverage.
+        // Release-profile timing is hardware/profile-sensitive and is not directly
+        // comparable to Kani symbolic verification time.
         const CASES: usize = 1_000_000;
         const MAX_LEN: usize = 11;
         let mut state = 0x4d59_5df4_d0f3_3173u64;
@@ -611,6 +647,16 @@ mod tests {
     }
 
     // decode_string tests
+
+    #[test]
+    fn test_decode_string_rejects_length_extent_overflow() {
+        let mut data = Vec::new();
+        super::super::encode::encode_integer(usize::MAX, 7, 0, &mut data);
+
+        let result = decode_string(&data);
+
+        assert!(matches!(result, Err(HpackError::InvalidInteger)));
+    }
 
     #[test]
     fn test_decode_string_empty_input() {
