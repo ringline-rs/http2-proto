@@ -34,8 +34,22 @@ impl FlowControl {
     }
 
     /// Increase the window (from WINDOW_UPDATE).
-    pub fn increase_window(&mut self, increment: u32) {
-        self.window = self.window.saturating_add(increment as i32);
+    /// Increase the window by a WINDOW_UPDATE increment.
+    ///
+    /// Returns `false` if the increment would take the window above
+    /// `MAX_WINDOW_SIZE` (2^31 - 1), which RFC 7540 section 6.9.1 requires to
+    /// be a `FLOW_CONTROL_ERROR`. The window is left unchanged so the caller
+    /// can signal it. This previously saturated silently, which was memory-safe
+    /// but hid a condition the spec requires reporting.
+    #[must_use = "an unapplied increment is a FLOW_CONTROL_ERROR and must be signalled"]
+    pub fn increase_window(&mut self, increment: u32) -> bool {
+        match self.window.checked_add_unsigned(increment) {
+            Some(w) => {
+                self.window = w;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Consume window capacity (data sent or received).
@@ -84,6 +98,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn window_rejects_overflowing_increment() {
+        let mut fc = FlowControl::new(65_535);
+        let mut applied = 0;
+        loop {
+            let before = fc.available();
+            if !fc.increase_window(1 << 30) {
+                assert_eq!(fc.available(), before, "must leave the window unchanged");
+                break;
+            }
+            applied += 1;
+            assert!(fc.available() > 0, "window wrapped negative");
+            assert!(applied < 10, "increment was never rejected");
+        }
+        assert!(
+            applied >= 1,
+            "a legitimate increment must still be accepted"
+        );
+    }
+
+    #[test]
     fn test_initial_state() {
         let fc = FlowControl::new(65535);
         assert_eq!(fc.available(), 65535);
@@ -118,7 +152,7 @@ mod tests {
         fc.consume(30000);
         assert_eq!(fc.available(), 35535);
 
-        fc.increase_window(20000);
+        assert!(fc.increase_window(20000));
         assert_eq!(fc.available(), 55535);
     }
 

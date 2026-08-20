@@ -305,36 +305,23 @@ impl FrameDecoder {
 
     /// Validate a setting value.
     fn validate_setting(&self, id: SettingId, value: u32) -> Result<(), FrameError> {
-        match id {
-            SettingId::EnablePush => {
-                if value > 1 {
-                    return Err(FrameError::InvalidSettingValue {
-                        id: id.to_u16(),
-                        value,
-                    });
-                }
-            }
-            SettingId::InitialWindowSize => {
-                // Must not exceed 2^31 - 1
-                if value > 0x7FFF_FFFF {
-                    return Err(FrameError::InvalidSettingValue {
-                        id: id.to_u16(),
-                        value,
-                    });
-                }
-            }
-            SettingId::MaxFrameSize => {
-                // Must be between 16384 and 16777215
-                if !(16_384..=16_777_215).contains(&value) {
-                    return Err(FrameError::InvalidSettingValue {
-                        id: id.to_u16(),
-                        value,
-                    });
-                }
-            }
-            _ => {}
+        let valid = match id {
+            SettingId::EnablePush => value <= 1,
+            // Must not exceed 2^31 - 1
+            SettingId::InitialWindowSize => value <= 0x7FFF_FFFF,
+            // Must be between 16384 and 16777215
+            SettingId::MaxFrameSize => (16_384..=16_777_215).contains(&value),
+            _ => true,
+        };
+
+        if valid {
+            Ok(())
+        } else {
+            Err(FrameError::InvalidSettingValue {
+                id: id.to_u16(),
+                value,
+            })
         }
-        Ok(())
     }
 
     /// Parse PUSH_PROMISE frame.
