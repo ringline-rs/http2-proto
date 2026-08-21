@@ -13,6 +13,9 @@ categories = ["network-programming", "parsing"]
 default = ["tls"]
 tls = ["dep:rustls", "dep:webpki-roots"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 bytes = "1"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
